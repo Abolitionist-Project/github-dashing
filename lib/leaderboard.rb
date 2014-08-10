@@ -5,6 +5,10 @@ require 'ostruct'
 require 'logger'
 require 'octokit'
 
+# Weighting on additions and deletions are capped to avoid large refactorings or library
+# additions unfairly influencing the overall score. Github only provides
+# "additions by author by week", so there's no way to exclude thirdparty folders.
+# So if you add a 10,000 LOC library, it'll still only count as commits_additions_max points.
 class Leaderboard
 
 	attr_accessor :backend, :logger
@@ -15,15 +19,60 @@ class Leaderboard
 		@logger.level = Logger::DEBUG unless ENV['RACK_ENV'] == 'production'
 	end
 
+	# Options
+	# - orgas: (Array) github organization names
+	# - repos: (Array) github repository names
+	# - since: (Datetime)
+	# - weighting: (Hash) Event names to a numerical multiplier. Set to nil to disable weighting
+	# - edits_weighting: (Hash) Constraints for LOC counts.
+	#   Required keys: commits_additions_max, commits_additions_loc_threshold, 
+	#   commits_deletions_max, commits_deletions_loc_threshold
+	# - limit: (Integer) Maximum number of users to show in board
+	# - days_interval: (Integer) Number of days to check for a period
+	# - event_titles: (Hash) Event names to titles used in detail descriptions on the widget
+	# - skip_orga_members: (Array) Github organization names for which to exclude members.
+	def get(opts={})
+		default_opts = {
+			:days_interval => 30,
+			:limit => 15,
+			:edits_weighting => {
+				'commits_additions_max'=>100,
+				'commits_additions_loc_threshold'=>1000,
+				'commits_deletions_max'=>100,
+				'commits_deletions_loc_threshold'=>1000,
+			},
+			:weighting => {
+				'issues_opened'=>5,
+				'issues_closed'=>5,
+				'pulls_opened'=>10,
+				'pulls_closed'=>5,
+				'pulls_comments'=>1,
+				'issues_comments'=>1,
+				'commits_comments'=>1,
+				# 'commits_additions'=>0.005,
+				# 'commits_deletions'=>0.005,
+				'commits'=>20
+			},
+			:event_titles => {
+				'commits' => 'commits',
+				'issues_comments' => 'issue comments',
+				'pulls_comments' => 'pull request comments',
+				'issues_comments' => 'issue comments',
+				'issues_opened' => 'opened issues',
+				'issues_closed' => 'closed issues',
+				'pulls_closed' => 'closed pull requests',
+				'commits_additions' => 'lines of code added',
+				'commits_deletions' => 'lines of code deleted',
+			},
+			:skip_orga_members => []
+		}
+		opts = OpenStruct.new(default_opts.deep_merge(opts))
+		opts.skip_orga_members ||= []
+		opts.date_until ||= Time.now.to_datetime
 
-	def get(opts=nil)
-		opts = OpenStruct.new(opts) unless opts.kind_of? OpenStruct
+		# Comparing current with last period, so need twice the interval
+		date_since = opts.date_until - opts.days_interval*2
 
-		date_since = opts.since || 3.months.ago.to_datetime
-		date_until = opts.date_until || Time.now.to_datetime
-		date_interval = opts.date_interval || 30.days
-		date_since = Time.at(date_until.to_i - date_interval*2)
-		
 		events = GithubDashing::EventCollection.new(
 			@backend.contributor_stats_by_author(opts).to_a +
 			@backend.issue_comment_count_by_author(opts).to_a +
@@ -31,7 +80,6 @@ class Leaderboard
 			@backend.issue_count_by_author(opts).to_a +
 			@backend.pull_count_by_author(opts).to_a
 		)
-
 		# TODO Pretty much everything below would be better expressed in 
 		# SQL with 1/4th the lines of code
 
@@ -39,18 +87,21 @@ class Leaderboard
 		events_by_actor = {}
 		events.each do |event|
 			# Filter by date range
-			next if event.datetime < date_since or event.datetime > date_until
+			next if event.datetime < date_since or event.datetime > opts.date_until
 
 			author = event.key
-			period = (event.datetime > Time.at(date_until.to_i - date_interval)) ? 'current' : 'previous'
+			period = (event.datetime > opts.date_until - opts.days_interval) ? 'current' : 'previous'
 			events_by_actor[author] ||= {'periods' => {}}
 			events_by_actor[author]['periods'][period] ||= Hash.new(0)
 			events_by_actor[author]['periods'][period][event.type] += event.value || 1
 		end
-		
+
 		# Add score for each period
 		actors_scored = {}
 		events_by_actor.each do |actor,actor_data|
+			is_from_org = opts.skip_orga_members.select {|org|@backend.organization_member?(org, actor)}.length > 0
+			next if is_from_org
+
 			actor_data['periods'].each do |period,period_data|
 				desc = []
 				blacklist = ['commits_additions','commits_deletions']
@@ -62,7 +113,8 @@ class Leaderboard
 					end
 					.inject(0) do |c,(k,v)|
 						weight = opts.weighting.has_key?(k) ? opts.weighting[k] : 0
-						desc.push "(#{k}=#{v} * weight=#{weight})" if v and v.to_i > 0
+						event_title = opts.event_titles.has_key?(k) ? opts.event_titles[k] : k
+						desc.push "#{v} #{event_title} * #{weight} points" if v and v.to_i > 0
 						c += (v.to_f * weight.to_f).to_i
 					end
 
@@ -74,16 +126,17 @@ class Leaderboard
 						loc_counted = [loc_actual,loc_threshold].min
 						score_max = opts.edits_weighting["commits_#{type}_max"]
 						score_actual = (score_max * (loc_counted.to_f/loc_threshold.to_f)).to_i
+						event_title = opts.event_titles.has_key?("commits_#{type}") ? opts.event_titles["commits_#{type}"] : "commits_#{type}"
 						desc.push(
-							"(lines of code #{type} actual: #{loc_actual}, " +
+							"#{event_title} #{score_actual} points (<em>actual: #{loc_actual}, " +
 							"threshold: #{loc_threshold}, counted: #{loc_counted}, " +
-							"max score: #{score_max}, actual score: #{score_actual})"
+							"max points: #{score_max}</em>)"
 						)
 						period_data['score'] += score_actual
 					end
 				end
 
-				period_data['desc'] = desc.join(' + ')
+				period_data['desc'] = desc.join('<br>+ ')
 			end
 			actors_scored[actor] = {
 				'current_score' => 0,
@@ -109,6 +162,5 @@ class Leaderboard
 		# Limit to top list
 		actors_scored[0,opts.limit || 10]
 	end
-
 
 end

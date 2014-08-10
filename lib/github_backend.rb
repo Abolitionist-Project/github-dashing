@@ -24,6 +24,7 @@ class GithubBackend
 			# Can't limit timeframe
 			begin
 				stats = request('contributors_stats', [repo]) || []
+				next unless stats.is_a?(Array)
 				stats.each do |stat|
 					stat.weeks.each do |week|
 						next unless stat.author
@@ -221,6 +222,10 @@ class GithubBackend
 
 	def repo_stats(opts)
 		# TODO
+	end
+
+	def organization_member?(org, user)
+		request('organization_member?', [org, user])
 	end
 
 	def get_repos(opts)
